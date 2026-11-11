@@ -9,6 +9,7 @@ The version appears in several places that must agree; `tests/distribution.test.
 - `package.json` and `package-lock.json`
 - `action.yml` (the Action installs exactly this version)
 - `plugin/.claude-plugin/plugin.json`, `plugin/hooks/hooks.json` and `.claude-plugin/marketplace.json`
+- `server.json` (its `version` and the package's `version`; `name` must equal `mcpName` in `package.json`)
 - the install snippets in `README.md` and `docs/integrations.md`, and the site (`site/index.html`)
 
 ## Release steps
@@ -62,3 +63,23 @@ the directory always holds for a reviewer to read. The directory follows the def
 - **Discussions** on, for questions that are not bugs.
 - **Branch protection** on `main`: require the `Test CLI` checks.
 - A **security policy** is in `SECURITY.md`; enable private vulnerability reporting.
+
+## MCP registry
+
+`server.json` describes `agent-roast mcp` for the [official MCP registry](https://modelcontextprotocol.io/registry/quickstart),
+which hosts metadata only and checks that the npm package carries the same name in `mcpName` (`package.json`).
+
+`.github/workflows/mcp-registry.yml` publishes it with GitHub OIDC, so there is no token and no login on a laptop. After
+"Release to npm" succeeds it waits until npm serves the version in `server.json`, installs `mcp-publisher` and runs
+`login github-oidc` and `publish`. To publish a version that is already on npm by hand: Actions, "Publish to the MCP registry",
+Run workflow. The publisher is pinned to a release and to the sha256 in that release's checksums file; raise both together.
+
+Check it: `curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=agent-roast"`. A rejection naming the namespace
+usually means the owner's name differs in case: `name` in `server.json` and `mcpName` in `package.json` must stay equal and
+start with `io.github.` and the GitHub owner. Without CI, install `mcp-publisher` (the quickstart has the download), run
+`mcp-publisher login github`, approve the device code in the browser, then `mcp-publisher publish` from the repository root.
+
+Each release raises `version` in `server.json` (both places) with the other pins. Community indexes such as Glama and PulseMCP
+list servers from GitHub and the registry on their own; other lists (for example awesome-mcp-servers) take a pull request from a
+person, and many refuse text written by a model, so write the entry yourself.
+

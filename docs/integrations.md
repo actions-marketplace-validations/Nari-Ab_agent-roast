@@ -1,15 +1,16 @@
 # Integrations
 
-agent-roast can stop a weakened check at four points. Use as many as you like; they share one set of rules and one policy file.
+agent-roast can stop a weakened check at five points. Use as many as you like; they share one set of rules and one policy file.
 
 | Where | What happens | Command |
 | --- | --- | --- |
 | **The agent is about to finish** | The agent is sent back once to fix the code | `agent-roast hook install` |
+| **The agent asks first** | Any MCP-capable agent can call a read-only tool before it says it is done | `agent-roast mcp`, see [MCP server](#mcp-server) |
 | **You are about to commit** | The commit is refused | `agent-roast init --hook`, or [pre-commit](#the-pre-commit-framework) |
 | **A pull request is opened** | The check fails, annotates and comments | [GitHub Action](#github-actions) |
 | **Any time** | You look | `npx agent-roast`, `npx agent-roast replay` |
 
-- [Claude Code](#claude-code) · [Codex](#codex) · [Cursor](#cursor) · [AGENTS.md and CLAUDE.md](#agentsmd-and-claudemd)
+- [Claude Code](#claude-code) · [Codex](#codex) · [Cursor](#cursor) · [AGENTS.md and CLAUDE.md](#agentsmd-and-claudemd) · [MCP server](#mcp-server)
 - [Git hook and pre-commit](#git-hooks) · [GitHub Actions](#github-actions) · [other CI](#other-ci) · [the API](#programmatic-use)
 
 ---
@@ -23,8 +24,9 @@ npx agent-roast hook install claude     # or name them: claude, codex, cursor
 
 `hook install` adds a **Stop hook** to the agent's own settings. It keeps everything else in the file, can be run again to
 refresh the pinned version, and refuses to touch a file it cannot parse. Add `--global` for every repository of your user,
-`--local` for Claude Code's untracked `.claude/settings.local.json`, `--dry-run` to preview, and `--instructions` to also write
-a short "keep the checks honest" paragraph into `AGENTS.md` / `CLAUDE.md`.
+`--local` for Claude Code's untracked `.claude/settings.local.json`, `--dry-run` to preview, `--advisory` to
+[only warn](#try-it-without-blocking-anything), and `--instructions` to also write a short "keep the checks honest" paragraph
+into `AGENTS.md` / `CLAUDE.md`.
 
 The hook runs `npx --yes agent-roast@<version> hook run --agent <name>`. The version is **pinned** to the one that installed it,
 so an agent never runs newer code than you reviewed. Re-run `hook install` after upgrading. If agent-roast is installed
@@ -45,6 +47,18 @@ globally, `--command agent-roast` skips `npx`.
 An intended change is simple to accept: **commit it**. A committed change becomes the baseline, so the next review does not see
 it as new. To let an agent finish without the check for a while, `agent-roast hook pause --for 2h` (and `hook resume`), or set
 `AGENT_ROAST_HOOK=off` in the environment. Manage the installation with `hook status` and `hook uninstall`.
+
+### Try it without blocking anything
+
+```bash
+npx agent-roast hook install --advisory
+```
+
+In advisory mode the hook runs the same review, but the agent is **never sent back**: when it finishes with a weakened check you
+get the one-line warning from step 3 above and the agent carries on. Use it for a week to see what the hook would have said, then
+run `npx agent-roast hook install` again, without `--advisory`, to start sending agents back. `hook status` shows which mode each
+hook is in. For a hook you cannot edit, such as the Claude Code plugin's, set `AGENT_ROAST_HOOK=advisory` in the environment
+instead. Cursor has no channel for a message to the person, so there the warning goes to the hook's log.
 
 ### What it does not do
 
@@ -74,7 +88,7 @@ Or without the plugin system: `npx agent-roast hook install claude`, which write
 {
   "hooks": {
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "npx --yes agent-roast@0.12.2 hook run --agent claude", "timeout": 60 } ] }
+      { "hooks": [ { "type": "command", "command": "npx --yes agent-roast@0.14.0 hook run --agent claude", "timeout": 60 } ] }
     ]
   }
 }
@@ -113,6 +127,43 @@ in place when you run it again:
 
 ---
 
+## MCP server
+
+`agent-roast mcp` runs a small [MCP](https://modelcontextprotocol.io) server over stdio, so any agent that speaks MCP can ask
+"did my changes weaken a check?" before it says it is done. It is read-only and offline like the rest of agent-roast: nothing is
+run, written or sent, and it has no dependency. It answers both protocol eras, the `initialize` handshake of 2025-11-25 and
+earlier and the per-request metadata of 2026-07-28, and Claude Code's own connection check accepts it.
+
+| Tool | What it does |
+| --- | --- |
+| `review_worktree` | Everything not committed yet against `HEAD`, the same review the hook runs. |
+| `review_changes` | Two committed revisions, for example `main` and a branch (`base`, optional `head`). The rules come from the base revision. |
+| `stop_hook` | The Stop hook's check and answer, for plugin hooks of type `mcp_tool`. Meant to be called by a hook, not by hand. |
+
+```bash
+claude mcp add agent-roast -- npx --yes agent-roast@0.14.0 mcp      # Claude Code
+codex mcp add agent-roast -- npx --yes agent-roast@0.14.0 mcp       # Codex
+```
+
+Cursor reads `.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` for every project, and other clients take the same
+command and arguments:
+
+```json
+{ "mcpServers": { "agent-roast": { "command": "npx", "args": ["--yes", "agent-roast@0.14.0", "mcp"] } } }
+```
+
+The tools read only the project the server was started in and other worktrees of the same repository; a path outside it is
+refused, and a server started from the filesystem root has no project at all. When a client starts servers outside your
+project, name the directory: add `"--root", "/path/to/project"` to the arguments (`--root` can be given more than once). A check
+that fails or runs past 25 seconds ends with a message the agent can read, not a protocol error.
+
+A tool only helps when the agent calls it. The server tells the agent to call `review_worktree` before it says it is done, and
+`hook install --instructions` writes the same advice into `AGENTS.md` and `CLAUDE.md`. For a guarantee, use the
+[hook](#the-agent-hook), which does not depend on the agent remembering. To list the server in the official MCP registry, see
+[maintainers](maintainers.md#mcp-registry).
+
+---
+
 ## Git hooks
 
 ```bash
@@ -133,7 +184,7 @@ repos:
         name: agent-roast
         entry: agent-roast review --staged
         language: node
-        additional_dependencies: ["agent-roast@0.12.2"]
+        additional_dependencies: ["agent-roast@0.14.0"]
         pass_filenames: false
         always_run: true
 ```
@@ -196,10 +247,10 @@ with `github/codeql-action/upload-sarif`. Source snippets are left out of SARIF.
 
 ```bash
 # GitLab merge request pipeline (full history: GIT_DEPTH: 0)
-npx agent-roast@0.12.2 review --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --format markdown
+npx agent-roast@0.14.0 review --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --format markdown
 
 # Anything else
-npx agent-roast@0.12.2 review --base origin/main --format github   # or json, markdown, sarif
+npx agent-roast@0.14.0 review --base origin/main --format github   # or json, markdown, sarif
 ```
 
 Before putting it in CI, see what it would have said about your recent history: `npx agent-roast replay`.

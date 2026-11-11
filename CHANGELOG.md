@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.14.0 — 2026-11-11
+
+**Try the hook without risk.** `agent-roast hook install --advisory` adds the hook in a mode where the agent is never sent
+back: when it finishes with a weakened check, you get the one-line warning and the agent carries on. Run it for a week to see
+what the hook would have said, then install it again without `--advisory` to start sending agents back. `hook status` shows
+which mode each hook is in. For a hook you cannot edit, such as the Claude Code plugin's, set `AGENT_ROAST_HOOK=advisory` in
+the environment; `hook run --advisory` does the same for a command you write by hand. Cursor has no channel for a message to the
+person, so there the warning goes to the hook's log.
+
+Fixed on the way: Commander gives `--advisory` to the root command wherever it appears, so the hook commands now read it from
+there as well (a test through the real command line caught it).
+
+## 0.13.0 — 2026-11-11
+
+**An MCP server.** `agent-roast mcp` runs a small MCP server over stdio, so any agent that speaks MCP (Claude Code, Codex,
+Cursor and others) can ask whether its changes weaken a check before it says it is done. It is read-only and offline like the
+rest of agent-roast, and it has no dependency, so the built files still contain no network code.
+
+- Three tools: `review_worktree` (everything uncommitted against `HEAD`, the same review the hook runs), `review_changes`
+  (two committed revisions; the rules come from the base) and `stop_hook` (the Stop hook's answer, for plugin hooks of type
+  `mcp_tool`). All carry read-only annotations, and what a tool finds reaches the agent in the words the hook uses.
+- It answers both protocol eras: the `initialize` handshake of 2025-11-25 and earlier, and the per-request metadata of
+  2026-07-28 (`server/discover`, `resultType`, `UnsupportedProtocolVersionError`). Claude Code's connection check accepts it.
+- The tools read only the project the server was started in (and other worktrees of the same repository). A path outside it,
+  through `..` or a symlink, is refused; `--root <directory>` names more places, and a server started from the filesystem root
+  has no project until it is given one. A check is stopped after 25 seconds and a client can cancel it.
+- `server.json` and `mcpName` in `package.json` make it ready for the official MCP registry; `docs/maintainers.md` has the steps.
+
+Setup for Claude Code, Codex, Cursor and others is in `docs/integrations.md#mcp-server`. A tool only helps when the agent calls
+it, so the hook stays the way to guarantee a review.
+
 ## 0.12.2 — 2026-11-06
 
 The skip, focus and placeholder-assertion rules added in 0.12.0 for Go, Rust, Java, Kotlin, C#, Ruby, PHP and
