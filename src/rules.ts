@@ -23,9 +23,9 @@ export const RULE_GUIDES: Record<DetectorType, RuleGuide> = {
   },
   "trivial-assert": {
     title: "Assertion that always passes",
-    why: "Comparing a constant to itself does not check the implementation and cannot catch regressions.",
-    suggestion: "Call the real behavior and assert its output or observable side effect instead of comparing constants.",
-    example: "expect(true).toBe(true) → expect(canSignIn(validUser)).toBe(true)",
+    why: "Comparing a constant to itself, or checking the output of a function the test itself replaces with a mock, does not check the implementation and cannot catch regressions.",
+    suggestion: "Call the real behavior and assert its output or observable side effect instead of comparing constants. Mock the dependencies of the code under test, never the code under test.",
+    example: "expect(true).toBe(true) → expect(canSignIn(validUser)).toBe(true); jest.mock('./price', ...) then expect(price(cart)).toBe(42) → mock the price list and assert total(cart)",
   },
   "type-escape": {
     title: "Type, lint or coverage check bypass",
@@ -47,9 +47,9 @@ export const RULE_GUIDES: Record<DetectorType, RuleGuide> = {
   },
   "assertion-weakened": {
     title: "Exact check replaced by a weaker one",
-    why: "Swapping an exact assertion for toBeDefined, a truthiness check or `is not None` keeps the test green while it verifies far less.",
+    why: "Swapping an exact assertion for toBeDefined, a truthiness check, `is not None`, a bound (`>= 2` in place of `== 2`) or toMatchObject in place of toEqual keeps the test green while it verifies far less.",
     suggestion: "Restore the exact check, or assert the specific value the code should produce.",
-    example: "expect(total).toBe(42) → expect(total).toBeDefined()  (restore the exact check)",
+    example: "expect(total).toBe(42) → expect(total).toBeDefined()  (restore the exact check); expect(cost).toBe(2) → expect(cost).toBeLessThanOrEqual(2)  (pin the value again)",
   },
   "assertion-removed": {
     title: "Test checks less than before",

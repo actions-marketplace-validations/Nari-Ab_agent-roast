@@ -269,6 +269,28 @@ describe("a check that says the same thing with less in it", () => {
     expect(changed(py(before), py(after), "test_a.py")).toEqual(["assertion-weakened"]);
   });
 
+  it("pairs what changed by content: a weak check dropped and a bound added is not a weaker check", () => {
+    const test = (lines: string[]) => `def test_works():\n${lines.map(line => "    " + line).join("\n")}\n`;
+    // The real case: `is not None` replaced by `len(...) > 0` next to an `isinstance` that stayed.
+    expect(changed(test(["assert X is not None", "assert isinstance(X, str)"]), test(["assert isinstance(X, str)", "assert len(X) > 0"]), "test_a.py")).toEqual([]);
+    // Two checks that swapped places are not a change.
+    expect(changed(test(["assert a == 1", "assert b == 2"]), test(["assert b == 2", "assert a == 1"]), "test_a.py")).toEqual([]);
+    // An exact check replaced by a bound, with another check kept in front, is still reported.
+    expect(changed(test(["assert ready()", "assert count == 3"]), test(["assert ready()", "assert count > 0"]), "test_a.py")).toEqual(["assertion-weakened"]);
+  });
+
+  it("does not take the opposite expectation for a looser one", () => {
+    expect(changed(js("expect(send).toHaveBeenCalledWith(1);"), js("expect(send).not.toHaveBeenCalled();"), "a.test.ts")).toEqual([]);
+    expect(changed(js("expect(send).toHaveBeenCalledWith(1);"), js("expect(send).toHaveBeenCalled();"), "a.test.ts")).toEqual(["assertion-weakened"]);
+  });
+
+  it("does not report a dropped match= when the exception is kept to be checked", () => {
+    const raises = (head: string) => py(`${head}\n        parse('x')\n    assert info.value.reason == 1`.replace("    assert info.value.reason == 1", "    assert value"));
+    expect(changed(raises("with pytest.raises(ValueError, match='bad'):"), raises("with pytest.raises(ValueError) as info:"), "test_a.py")).toEqual([]);
+    expect(changed(raises("with pytest.raises(ValueError, match='bad'):"), raises("with pytest.raises(ValueError):"), "test_a.py")).toEqual(["assertion-weakened"]);
+    expect(changed(raises("with pytest.raises(ValueError, match='bad'):"), raises("with pytest.raises(Exception) as info:"), "test_a.py")).toEqual(["assertion-weakened"]);
+  });
+
   it.each([
     ["with pytest.raises(Exception):\n        parse('x')", "with pytest.raises(ValueError):\n        parse('x')"],
     ["with pytest.raises(ValueError, match='a'):\n        parse('x')", "with pytest.raises(ValueError, match='b'):\n        parse('x')"],
@@ -278,6 +300,123 @@ describe("a check that says the same thing with less in it", () => {
     ["assert value != 0", "assert value > 0"],
   ])("leaves %s → %s alone", (before, after) => {
     expect(changed(py(before), py(after), "test_a.py")).toEqual([]);
+  });
+});
+
+describe("an exact check relaxed on the same expression", () => {
+  const js = (assertion: string) => `it("works", () => {\n  const value = run();\n  ${assertion}\n});\n`;
+  const py = (assertion: string) => `def test_works():\n    value = run()\n    ${assertion}\n`;
+  const changed = (before: string, after: string, file: string) => analyzeTestFile(file, file, before, after, "HEAD").immediate.map(f => f.type);
+
+  it.each([
+    ["expect(total).toBe(2);", "expect(total).toBeGreaterThanOrEqual(2);"],
+    ["expect(total).toEqual(9);", "expect(total).toBeGreaterThanOrEqual(9);"],
+    ["expect(cost.do).toBe(2);", "expect(cost.do).toBeLessThanOrEqual(2);"],
+    ["expect(res.status).toBe(500);", "expect(res.status).toBeGreaterThanOrEqual(400);"],
+    ["expect(items).toHaveLength(3);", "expect(items.length).toBeGreaterThan(1);"],
+    ["assert.equal(weak.length, 3);", "assert.ok(weak.length > 0);"],
+    ["expect(result).toEqual(newList);", "expect(result).toMatchObject(newList);"],
+    ["expect(h.calls[0]).toStrictEqual({ model: 'm', max: 512 });", "expect(h.calls[0]).toMatchObject({ model: 'm', max: 512 });"],
+  ])("reports %s → %s", (before, after) => {
+    expect(changed(js(before), js(after), "a.test.ts")).toEqual(["assertion-weakened"]);
+  });
+
+  it.each([
+    ["assert len(added) == 2", "assert len(added) >= 2"],
+    ["assert set(a) == set(b)", "assert set(a) <= set(b)"],
+    ["assert handler.level == logging.WARNING", "assert handler.level > logging.CRITICAL"],
+    ["assert count == 3", "assert count < 10"],
+    ["self.assertEqual(count, 3)", "self.assertGreaterEqual(count, 3)"],
+  ])("reports %s → %s", (before, after) => {
+    expect(changed(py(before), py(after), "test_a.py")).toEqual(["assertion-weakened"]);
+  });
+
+  it.each([
+    // An old check that expected nothing was flipped, not loosened.
+    ["expect(items).toHaveLength(0);", "expect(items).toBeGreaterThanOrEqual(1);"],
+    ["expect(total).toBe(0);", "expect(total).toBeGreaterThan(0);"],
+    // Another expression is another check.
+    ["expect(total).toBe(2);", "expect(other).toBeGreaterThanOrEqual(2);"],
+    // A bound made exact, or an object check made strict, is stronger.
+    ["expect(total).toBeGreaterThanOrEqual(2);", "expect(total).toBe(2);"],
+    ["expect(result).toMatchObject(list);", "expect(result).toEqual(list);"],
+    // New fields in the expectation: a different object, not the same one let through.
+    ["expect(result).toEqual({ a: 1 });", "expect(result).toMatchObject({ a: 1, b: 2 });"],
+    // Not a number: nothing to relax into a bound.
+    ["expect(total).toBe(LIMIT);", "expect(total).toBeGreaterThan(1);"],
+    // A negated check reads the other way round.
+    ["expect(total).not.toBe(2);", "expect(total).not.toBeLessThan(5);"],
+    ["expect(result).not.toEqual(list);", "expect(result).not.toMatchObject(list);"],
+    ["assert.notEqual(total, 2);", "assert.ok(total > 5);"],
+  ])("leaves %s → %s alone", (before, after) => {
+    expect(changed(js(before), js(after), "a.test.ts")).toEqual([]);
+  });
+
+  it.each([
+    ["assert len(x) == 0", "assert len(x) >= 1"],
+    ["assert value is None", "assert value > 0"],
+    ["assert total == 2", "assert other >= 2"],
+    ["assert total >= 2", "assert total == 2"],
+    // An empty value expected before, a non-empty one now: a flipped expectation. The closing bracket or quote is the last character.
+    ["assert tags == {}", "assert len(tags) > 0"],
+    ["assert tags == []", "assert len(tags) >= 1"],
+    ["assert name == ''", "assert len(name) > 0"],
+    ['assert name == ""', "assert len(name) > 0"],
+    ["assert tags == set()", "assert len(tags) > 0"],
+    ["assert ratio == 0.0", "assert ratio > 0"],
+  ])("leaves %s → %s alone", (before, after) => {
+    expect(changed(py(before), py(after), "test_a.py")).toEqual([]);
+  });
+
+  it("still reads a decimal that merely starts with zero as an exact value", () => {
+    expect(changed(py("assert ratio == 0.5"), py("assert ratio >= 0.5"), "test_a.py")).toEqual(["assertion-weakened"]);
+  });
+
+  describe("when assertions were added or removed in the same test", () => {
+    const many = (...assertions: string[]) => `it("works", () => {\n  const value = run();\n${assertions.map(assertion => `  ${assertion}`).join("\n")}\n});\n`;
+    const manyPy = (...assertions: string[]) => `def test_works():\n    value = run()\n${assertions.map(assertion => `    ${assertion}`).join("\n")}\n`;
+    const types = (before: string, after: string, file = "a.test.ts") => changed(before, after, file);
+
+    it("pairs the loosened check with its old self by the expression it checks", () => {
+      // Three checks in place of two: positions no longer line up, the expression does.
+      expect(types(many("expect(total).toBe(2);", "expect(other).toBe(1);"),
+        many("expect(total).toBeGreaterThanOrEqual(2);", "expect(other).toBe(1);", "expect(extra).toBe(7);"))).toEqual(["assertion-weakened"]);
+      // One check fewer: the loosening is reported next to the lost check.
+      expect(types(many("expect(total).toBe(2);", "expect(a).toBe(1);", "expect(b).toBe(2);"),
+        many("expect(total).toBeGreaterThanOrEqual(2);", "expect(a).toBe(1);"))).toContain("assertion-weakened");
+      expect(types(manyPy("assert len(x) == 3", "assert a == 1"), manyPy("assert len(x) >= 3", "assert a == 1", "assert b == 2"), "test_a.py")).toEqual(["assertion-weakened"]);
+    });
+
+    it("takes the new check that is the looser one when several share the expression", () => {
+      expect(types(many("expect(total).toBe(3);"), many("expect(total).toBeDefined();", "expect(total).toBeGreaterThan(2);"))).toEqual(["assertion-weakened"]);
+    });
+
+    it("leaves a check alone that is still in the file, wherever it moved to", () => {
+      const other = (assertion: string) => `it("moved", () => {\n  ${assertion}\n});\n`;
+      const before = many("expect(total).toBe(2);", "expect(other).toBe(1);") + other("expect(1).toBe(1);");
+      const after = many("expect(total).toBeGreaterThanOrEqual(2);", "expect(other).toBe(1);", "expect(extra).toBe(7);") + other("expect(total).toBe(2);");
+      expect(types(before, after)).toEqual([]);
+    });
+
+    it("leaves a check alone when the assertion that took its place still checks the same expression exactly", () => {
+      // `calls == 3` became an exact check on a value taken on the way; the bound was inserted earlier.
+      expect(types(many("assert.equal(calls, 2);", "assert.ok(warned);", "assert.equal(calls, 3);"),
+        many("assert.equal(calls, 2);", "assert.ok(calls > before);", "assert.ok(warned);", "assert.equal(calls, after);"), "a.test.js")).toEqual([]);
+      expect(types(many("assert.equal(calls, 3);"), many("assert.ok(calls > before);", "assert.equal(calls, after);"), "a.test.js")).toEqual([]);
+      // Without an exact successor the same pair is a loosened check.
+      expect(types(many("assert.equal(calls, 3);"), many("assert.ok(calls > before);", "assert.equal(other, 1);"), "a.test.js")).toEqual(["assertion-weakened"]);
+    });
+
+    it("looks for what an assertion turned into only where it stood, not elsewhere in the test", () => {
+      // The loop's comparison became a bound; an unrelated exact check on the same variable was added further down.
+      expect(types(manyPy("assert len(result) == len(sc)", "assert len(sc) == 1"),
+        manyPy("assert len(result) <= 1", "assert len(sc) == 1", "assert len(result) == 3"), "test_a.py")).toEqual(["assertion-weakened"]);
+    });
+
+    it("leaves an added check alone, and one that only changed its value", () => {
+      expect(types(many("expect(total).toBe(2);"), many("expect(total).toBe(2);", "expect(extra).toBeGreaterThan(1);"))).toEqual([]);
+      expect(types(many("expect(total).toBe(2);", "expect(a).toBe(1);"), many("expect(total).toBe(3);", "expect(a).toBe(1);", "expect(b).toBe(2);"))).toEqual([]);
+    });
   });
 });
 
@@ -366,6 +505,8 @@ describe("CI and package scripts that stop a check from failing", () => {
     ["      - run: npm test\n", "      - run: npm test\n      # - if: false\n"],
     ["      - run: npm test\n", "      - run: npm test\n      - if: false\n        run: echo a brand new step\n"],
     ["      - run: npm test || true\n", "      - run: npm test\n"],
+    // The same tolerance written another way: `continue-on-error` replaced by `|| true` in one change.
+    ["      - name: Test\n        run: npm test\n        continue-on-error: true\n", "      - name: Test\n        run: npm test || true\n"],
   ])("leaves %j → %j alone", (before, after) => {
     expect(ci(before, after)).toEqual([]);
   });
@@ -417,7 +558,10 @@ describe("Python lint and type-checker settings that got easier to pass", () => 
     ["pyproject.toml", RUFF, RUFF.replace('ignore = ["E501"]', 'extend-ignore = ["E501"]\nignore = ["E501", "B008"]'), "Lint or type checks switched off in the configuration"],
     ["pyproject.toml", RUFF, RUFF.replace('["E501"]', '[\n    "E501",\n    "F841",  # unused\n]'), "Lint or type checks switched off in the configuration"],
     ["ruff.toml", 'select = ["E"]\nignore = ["E501"]\n', 'select = ["E"]\nignore = ["E501", "E741"]\n', "Lint or type checks switched off in the configuration"],
-    ["pyproject.toml", RUFF, RUFF + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["S101"]\n', "Lint or type checks switched off in the configuration"],
+    ["pyproject.toml", RUFF, RUFF + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["B006"]\n', "Lint or type checks switched off in the configuration"],
+    // `TCH` is the old name of `TC`: a rule selected under the old prefix is enforced when it is ignored under the new one.
+    ["pyproject.toml", RUFF.replace('["E", "F", "B"]', '["E", "F", "TCH"]'), RUFF.replace('["E", "F", "B"]', '["E", "F", "TCH"]').replace('["E501"]', '["E501", "TC002"]'), "Lint or type checks switched off in the configuration"],
+    ["pyproject.toml", '[tool.ruff]\nline-length = 100\n', '[tool.ruff]\nline-length = 100\nignore = ["F401"]\n', "Lint or type checks switched off in the configuration"],
     ["pyproject.toml", RUFF, RUFF.replace('["E", "F", "B"]', '["E", "F"]'), "Lint rules removed from the selected set"],
     ["pyproject.toml", RUFF.replace('["E", "F", "B"]', '["ALL"]'), RUFF.replace('["E", "F", "B"]', '["E"]'), "Lint rules removed from the selected set"],
     ["setup.cfg", "[flake8]\nignore = E501\nmax-line-length = 88\n", "[flake8]\nignore = E501,F401\nmax-line-length = 88\n", "Lint or type checks switched off in the configuration"],
@@ -447,6 +591,11 @@ describe("Python lint and type-checker settings that got easier to pass", () => 
     ["pyproject.toml", MYPY_BASE().replace("true", "false"), MYPY_BASE()],
     [".pylintrc", "[MASTER]\nfail-under=7\n", "[MASTER]\nfail-under=9\n"],
     ["pyproject.toml", '[tool.black]\nline-length = 88\n[tool.isort]\nignore = ["x"]\n', '[tool.black]\nline-length = 88\n[tool.isort]\nignore = ["x", "y"]\n'],
+    // A rule enabled in the same change with its existing violations listed per file (a "debt register"), or a code outside the
+    // tool's default set, was not being checked: ignoring it switches nothing off.
+    ["pyproject.toml", RUFF, RUFF.replace('["E", "F", "B"]', '["E", "F", "B", "BLE"]') + '\n[tool.ruff.lint.per-file-ignores]\n"src/a.py" = ["BLE001"]\n'],
+    ["pyproject.toml", '[tool.ruff]\nline-length = 100\n', '[tool.ruff]\nline-length = 100\nignore = ["B008", "S101"]\n'],
+    ["pyproject.toml", RUFF, RUFF + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["S101"]\n'],
     // The same ignores for files that moved, or an ignore for a code that is already off everywhere, switch nothing new off.
     ["pyproject.toml", RUFF + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["S101"]\n', RUFF + '\n[tool.ruff.lint.per-file-ignores]\n"src/tests/*" = ["S101"]\n'],
     ["pyproject.toml", RUFF, RUFF + '\n[tool.ruff.lint.per-file-ignores]\n"tests/*" = ["E501"]\n'],

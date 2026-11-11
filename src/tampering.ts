@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { isTestFile } from "./metrics.js";
+import { mockedSubjects } from "./mocks.js";
 import { analyzePythonConfig } from "./pyconfig.js";
 import { RULE_GUIDES } from "./rules.js";
 import type { DetectorType, Infraction } from "./types.js";
@@ -211,7 +212,7 @@ function skeleton(assertion: string): string {
 }
 
 // `toHaveBeenCalled()` says a function ran, not with what; `toEqual(expect.anything())` accepts any value that exists.
-const WEAK_JS = /\.(?:toBeDefined|toBeTruthy|toBeFalsy|toBeUndefined)\s*\(|\.not\s*\.\s*(?:toBeNull|toBeUndefined|toThrow)\s*\(|\.toBeGreaterThanOrEqual\s*\(\s*0\s*\)|\.(?:toHaveBeenCalled|toBeCalled)\s*\(\s*\)|\.(?:toBe|toEqual|toStrictEqual)\s*\(\s*expect\s*\.\s*(?:anything\s*\(\s*\)|any\s*\(\s*\w+\s*\))\s*\)/;
+const WEAK_JS = /\.(?:toBeDefined|toBeTruthy|toBeFalsy|toBeUndefined)\s*\(|\.not\s*\.\s*(?:toBeNull|toBeUndefined|toThrow)\s*\(|\.toBeGreaterThanOrEqual\s*\(\s*0\s*\)|(?<!\.not)\.(?:toHaveBeenCalled|toBeCalled)\s*\(\s*\)|\.(?:toBe|toEqual|toStrictEqual)\s*\(\s*expect\s*\.\s*(?:anything\s*\(\s*\)|any\s*\(\s*\w+\s*\))\s*\)/;
 // "Not zero" in place of an exact count: weaker than `toHaveLength(3)`, but the reverse of `toHaveLength(0)`.
 const BOUND_JS = /\.toBeGreaterThan\s*\(\s*(?:0|-1)\s*\)|\.toBeGreaterThanOrEqual\s*\(\s*[01]\s*\)/;
 const ZERO_JS = /\.(?:toBe|toEqual|toStrictEqual|toHaveLength|toHaveBeenCalledTimes)\s*\(\s*(?:0|\[\s*\]|\{\s*\}|null|undefined|false|"")\s*\)/;
@@ -220,7 +221,8 @@ const ZERO_JS = /\.(?:toBe|toEqual|toStrictEqual|toHaveLength|toHaveBeenCalledTi
 const WEAK_PY = /^\s*assert\s+[\w.\[\]]+\s*(?:,.*)?$|^\s*assert\s+.+\bis\s+not\s+None\s*(?:,.*)?$|^\s*assert\s+True\b/;
 // `assert len(rows) > 0` in place of `assert len(rows) == 3`; not when the old check expected nothing (`== 0`, `is None`, `not x`).
 const BOUND_PY = /^\s*assert\s+.+(?:>\s*0|>=\s*[01])\s*(?:,.*)?$/;
-const EMPTY_PY = /==\s*(?:0|\[\s*\]|\{\s*\}|""|''|None|False)\b|\bis\s+None\b|\bnot\b|!=\s*(?:0|None)\b/;
+// (`\b` cannot follow `]`, `}` or a quote at the end of the text, so each alternative ends in the way that fits it.)
+const EMPTY_PY = /==\s*(?:0(?:\.0+)?(?![\w.])|\[\s*\]|\{\s*\}|""|''|\(\s*\)|(?:set|dict|list|tuple|frozenset)\(\s*\)|None\b|False\b)|\bis\s+None\b|\bnot\b|!=\s*(?:0|None)\b/;
 const PY_SPECIFIC = /==|!=|<=|>=|\bin\b|\bis\b|\bisinstance\s*\(|\.startswith\s*\(|\.endswith\s*\(|\bcallable\s*\(/;
 
 // Only an exact check can be weakened: `toBeNull()` becoming `toBeTruthy()` is a flipped expectation, not a looser one.
@@ -228,6 +230,77 @@ const JS_SPECIFIC = /\.(?:toBe|toEqual|toStrictEqual|toHaveLength|toContain|toCo
 
 // Testing Library's getBy*/findBy* queries throw when nothing matches, so `toBeTruthy()` on one is still a presence check.
 const THROWING_QUERY = /\b(?:get|find)(?:All)?By\w*\s*\(/;
+
+/** What an assertion checks: the argument of `expect(...)`, the left side of `assert x == 1`, the first argument of
+ * `assert.equal(...)`. Whitespace and a trailing `.length` are dropped, so `items`, `items.length` and `len(items)` compare equal. */
+function checkedExpression(assertion: string, language: Language): string | null {
+  const squash = (text: string) => text.replace(/\s+/g, "").replace(/^len\((.*)\)$/, "$1").replace(/\.length$/, "");
+  if (language === "py") {
+    const operand = /^\s*assert\s+(?:not\s+)?(.+?)\s*(?:==|!=|>=|<=|>|<|\bin\b|\bis\b)/.exec(assertion)?.[1] ?? /\bself\s*\.\s*assert\w*\s*\(\s*([^,]+?)\s*,/.exec(assertion)?.[1];
+    return operand ? squash(operand) : null;
+  }
+  const start = assertion.search(/(?<![\w$.])expect\s*\(/);
+  if (start >= 0) {
+    const open = assertion.indexOf("(", start);
+    let depth = 0;
+    for (let i = open; i < assertion.length; i++) {
+      if (assertion[i] === "(") depth++;
+      else if (assertion[i] === ")" && --depth === 0) return squash(assertion.slice(open + 1, i));
+    }
+    return null;
+  }
+  const node = /assert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual|ok)\s*\(\s*([^,)]+?)\s*(?:,|\)|>=|<=|>|<)/.exec(assertion)?.[1];
+  return node ? squash(node) : null;
+}
+
+/** The text of the first argument of the matcher `name(...)` in `assertion`, whitespace dropped. */
+function matcherArgument(assertion: string, name: string): string | null {
+  const open = new RegExp(`\\.\\s*${name}\\s*\\(`).exec(assertion);
+  if (!open) return null;
+  let depth = 1;
+  for (let i = open.index + open[0].length; i < assertion.length; i++) {
+    if ("([{".includes(assertion[i])) depth++;
+    else if (")]}".includes(assertion[i]) && --depth === 0) return assertion.slice(open.index + open[0].length, i).replace(/\s+/g, "");
+  }
+  return null;
+}
+
+/** An equality with any value: `toBe(x)`, `toEqual(x)`, `toHaveLength(x)`, `assert.equal(a, b)`, `assert a == b`, `self.assertEqual(a, b)`. */
+function isExact(assertion: string, language: Language): boolean {
+  if (language === "js") {
+    return !/\.\s*not\s*\./.test(assertion) && (/\.(?:toBe|toEqual|toStrictEqual|toHaveLength)\s*\(/.test(assertion) || /assert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual)\s*\(/.test(assertion));
+  }
+  if (language === "py") return /^\s*assert\s+.+?\s*==\s*\S/.test(assertion) || /\bself\s*\.\s*assertEqual\s*\(/.test(assertion);
+  return false;
+}
+
+/** An exact check on an expression turned into a bound on the same expression (`toBe(2)` → `toBeGreaterThanOrEqual(2)`,
+ * `assert len(x) == 3` → `assert len(x) >= 3`, `set(a) == set(b)` → `set(a) <= set(b)`), or `toEqual(X)` into `toMatchObject(X)`
+ * with the same argument, which lets extra properties through. An old check that expected nothing (zero, empty, None) was flipped,
+ * not loosened, so it is left alone, and so is an old check whose expression is still checked exactly by another assertion that took its
+ * place (`siblings`: `assert.equal(calls, 3)` became `assert.equal(calls, after)`, next to a new `assert.ok(calls > before)`): the value was
+ * edited, not relaxed. */
+function relaxes(oldAssertion: string, newAssertion: string, language: Language, siblings: string[] = []): boolean {
+  const subject = checkedExpression(oldAssertion, language);
+  if (!subject || subject !== checkedExpression(newAssertion, language)) return false;
+  if (siblings.some(other => isExact(other, language) && checkedExpression(other, language) === subject)) return false;
+  if (language === "js") {
+    // A negated check reads the other way round: `.not.toBe(2)` turned into `.not.toBeLessThan(5)` is stricter, not looser.
+    if (/\.\s*not\s*\./.test(oldAssertion) || /\.\s*not\s*\./.test(newAssertion)) return false;
+    const exact = /\.(?:toBe|toEqual|toStrictEqual|toHaveLength)\s*\(\s*(-?\d+(?:\.\d+)?)\s*\)/.exec(oldAssertion)?.[1] ?? /assert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual)\s*\([^,]+,\s*(-?\d+(?:\.\d+)?)\s*[,)]/.exec(oldAssertion)?.[1];
+    const bound = /\.(?:toBeGreaterThan|toBeGreaterThanOrEqual|toBeLessThan|toBeLessThanOrEqual)\s*\(/.test(newAssertion) || /assert\s*\.\s*ok\s*\([^;]*(?:>=|<=|>|<)/.test(newAssertion);
+    if (exact !== undefined && Number(exact) !== 0 && bound) return true;
+    const same = matcherArgument(oldAssertion, "toEqual") ?? matcherArgument(oldAssertion, "toStrictEqual");
+    return same !== null && same !== "" && same === matcherArgument(newAssertion, "toMatchObject");
+  }
+  if (language === "py") {
+    if (EMPTY_PY.test(oldAssertion)) return false;
+    const exact = /^\s*assert\s+.+?\s*==\s*\S/.test(oldAssertion) || /\bself\s*\.\s*assertEqual\s*\(/.test(oldAssertion);
+    const bound = (/^\s*assert\s+.+?\s*(?:>=|<=|>|<)\s*\S/.test(newAssertion) && !/==/.test(newAssertion.replace(/[<>]=/g, ""))) || /\bself\s*\.\s*assert(?:Greater|Less)(?:Equal)?\s*\(/.test(newAssertion);
+    return exact && bound;
+  }
+  return false;
+}
 
 /** The same kind of check with less pinned down: `toThrow("bad input")` → `toThrow()`, `raises(ValueError, match="x")` →
  * `raises(Exception)`, `assertRaisesRegex(ValueError, "x")` → `assertRaises(ValueError)`. */
@@ -239,27 +312,29 @@ function pinsLess(oldAssertion: string, newAssertion: string, language: Language
   }
   if (language === "py") {
     const raised = (text: string) => {
+      // `... as info:` keeps the exception, so its message can be checked on the next line instead of through `match=`.
+      const captured = /\)\s*as\s+\w+/.test(text);
       const marker = /\bpytest\s*\.\s*raises\s*\(\s*([\w.]+|\([^)]*\))([^)]*)\)/.exec(text);
-      if (marker) return { type: marker[1], message: /\bmatch\s*=/.test(marker[2]) };
+      if (marker) return { type: marker[1], message: /\bmatch\s*=/.test(marker[2]), captured };
       const unit = /\bassertRaises(Regex)?\s*\(\s*([\w.]+|\([^)]*\))/.exec(text);
-      return unit ? { type: unit[2], message: !!unit[1] } : null;
+      return unit ? { type: unit[2], message: !!unit[1], captured } : null;
     };
     const was = raised(oldAssertion), now = raised(newAssertion);
     const broad = (type: string) => /^(?:builtins\.)?(?:Base)?Exception$/.test(type);
-    return !!was && !!now && ((was.message && !now.message) || (!broad(was.type) && broad(now.type)));
+    return !!was && !!now && ((was.message && !now.message && !now.captured) || (!broad(was.type) && broad(now.type)));
   }
   return false;
 }
 
 function isWeaker(oldAssertion: string, newAssertion: string, language: Language): boolean {
-  if (pinsLess(oldAssertion, newAssertion, language)) return true;
+  if (pinsLess(oldAssertion, newAssertion, language) || relaxes(oldAssertion, newAssertion, language)) return true;
   if (language === "js") {
     if (THROWING_QUERY.test(newAssertion) || !JS_SPECIFIC.test(oldAssertion) || WEAK_JS.test(oldAssertion) || BOUND_JS.test(oldAssertion)) return false;
     return WEAK_JS.test(newAssertion) || (BOUND_JS.test(newAssertion) && !ZERO_JS.test(oldAssertion));
   }
   if (language === "py") {
     if (WEAK_PY.test(oldAssertion) || BOUND_PY.test(oldAssertion) || !PY_SPECIFIC.test(oldAssertion)) return false;
-    return WEAK_PY.test(newAssertion) || (BOUND_PY.test(newAssertion) && !EMPTY_PY.test(oldAssertion));
+    return WEAK_PY.test(newAssertion) || (BOUND_PY.test(newAssertion) && !EMPTY_PY.test(oldAssertion) && /==|\bin\b|[<>]=?/.test(oldAssertion));
   }
   return false;
 }
@@ -284,6 +359,34 @@ function finding(type: DetectorType, file: string, line: number, snippet: string
   return { type, file, lineNumber: Math.max(1, line), lineSnippet: snippet, commitHash: commit, commitDate: "", reason, suggestion: RULE_GUIDES[type].suggestion };
 }
 
+/** The order-preserving pairing of two assertion lists that keeps the most assertions (old index → new index): the ones that stayed, in
+ * place. What lies between two of them on one side is what the same stretch of the other side turned into. */
+function alignAssertions(before: string[], after: string[]): Map<number, number> {
+  const table = Array.from({ length: before.length + 1 }, () => new Array<number>(after.length + 1).fill(0));
+  for (let i = before.length - 1; i >= 0; i--) {
+    for (let j = after.length - 1; j >= 0; j--) table[i][j] = before[i] === after[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+  }
+  const pairs = new Map<number, number>();
+  for (let i = 0, j = 0; i < before.length && j < after.length;) {
+    if (before[i] === after[j]) { pairs.set(i, j); i++; j++; }
+    else if (table[i + 1][j] >= table[i][j + 1]) i++;
+    else j++;
+  }
+  return pairs;
+}
+
+/** Indexes of the assertions in `from` that `against` does not have (by content, counting repeats): what is left once everything that
+ * stayed, wherever it moved to, is taken out. */
+function unmatchedIndexes(from: string[], against: string[]): number[] {
+  const budget = new Map<string, number>();
+  for (const assertion of against) budget.set(assertion, (budget.get(assertion) ?? 0) + 1);
+  return from.map((assertion, i) => ({ assertion, i })).filter(({ assertion }) => {
+    const available = budget.get(assertion) ?? 0;
+    if (available > 0) { budget.set(assertion, available - 1); return false; }
+    return true;
+  }).map(({ i }) => i);
+}
+
 /** Compare a test file's behavior-checking surface before and after a change. */
 export function analyzeTestFile(oldPath: string, newPath: string, oldText: string | null, newText: string | null, commit: string): FileTampering {
   const language = languageOf(newText === null ? oldPath : newPath);
@@ -302,6 +405,11 @@ export function analyzeTestFile(oldPath: string, newPath: string, oldText: strin
   const addedText = after.filter(test => !beforeKeys.has(test.key)).map(test => test.text).join("\n");
   const result: FileTampering = { immediate: [], removedTests: [], addedHashes: [], rewritten: [] };
   for (const test of after) if (!beforeKeys.has(test.key)) result.addedHashes.push(test.bodyHash);
+  // A test that checks what its own mock returns checks nothing: report each such mock that this change introduced.
+  const mockedBefore = new Set((oldText === null ? [] : mockedSubjects(oldText, oldPath)).map(item => item.key));
+  for (const item of newText === null ? [] : mockedSubjects(newText, newPath)) {
+    if (!mockedBefore.has(item.key)) result.immediate.push(finding("trivial-assert", newPath, item.line, item.snippet, item.reason, commit));
+  }
   for (const old of before) {
     const current = afterByKey.get(old.key);
     if (!current) {
@@ -318,6 +426,34 @@ export function analyzeTestFile(oldPath: string, newPath: string, oldText: strin
     // Folding several checks into one snapshot of the whole result is a stronger check, not a weaker one.
     const snapshot = (test: TestInfo) => test.raw.some(statement => /\.toMatch(?:Inline)?Snapshot\b|\.matchSnapshot\b|\bsnapshot\s*\(/.test(statement));
     if (snapshot(current) && !snapshot(old)) continue;
+    // An assertion edited in place while others were added or removed cannot be paired by position; it is paired by what it checks:
+    // the same expression with a looser matcher. Only the relaxations that cannot be a change of scenario are read this way, and
+    // an assertion that is still somewhere in the file was moved, not loosened.
+    if (old.assertions.length && current.assertions.length && current.assertions.length !== old.assertions.length
+      && old.assertions.length * current.assertions.length <= 250_000) {
+      const aligned = alignAssertions(old.assertions, current.assertions);
+      const fresh = unmatchedIndexes(current.assertions, old.assertions);
+      const gone = unmatchedIndexes(old.assertions, current.assertions)
+        .filter(index => (newTotals.get(old.assertions[index]) ?? 0) < (oldTotals.get(old.assertions[index]) ?? 0));
+      for (const index of gone) {
+        const was = checkedExpression(old.raw[index], language);
+        if (was === null) continue;
+        // What it turned into, if it was edited in place: the new assertions between the ones that stayed on each side of it.
+        let low = -1, high = current.assertions.length;
+        for (const [from, to] of aligned) {
+          if (from < index) low = Math.max(low, to);
+          else if (from > index) high = Math.min(high, to);
+        }
+        const successors = fresh.filter(candidate => candidate > low && candidate < high);
+        const siblings = successors.map(candidate => current.raw[candidate]);
+        const partner = successors.find(candidate => checkedExpression(current.raw[candidate], language) === was && relaxes(old.raw[index], current.raw[candidate], language, siblings));
+        if (partner !== undefined) {
+          result.immediate.push(finding("assertion-weakened", newPath, current.line,
+            `${old.name}: ${old.raw[index].slice(0, 80)} → ${current.raw[partner].slice(0, 80)}`, "Assertion replaced by a weaker check", commit));
+          break;
+        }
+      }
+    }
     if (current.assertions.length < old.assertions.length) {
       // The checks moved into an assertion helper that this change introduces: they are still made, just not here.
       if ([...current.text.matchAll(HELPER_CALL)].some(call => !(oldText ?? "").includes(call[1]))) continue;
@@ -343,8 +479,10 @@ export function analyzeTestFile(oldPath: string, newPath: string, oldText: strin
       continue;
     }
     if (current.assertions.length === old.assertions.length && old.assertions.length > 0) {
-      const changed = old.assertions.map((assertion, i) => ({ before: assertion, after: current.assertions[i], rawBefore: old.raw[i], rawAfter: current.raw[i] }))
-        .filter(pair => pair.before !== pair.after);
+      // An assertion that is still there, wherever it moved to inside the test, is not part of the change: pair what is left.
+      const goneIndexes = unmatchedIndexes(old.assertions, current.assertions), freshIndexes = unmatchedIndexes(current.assertions, old.assertions);
+      const changed = goneIndexes.map((index, k) => ({ before: old.assertions[index], after: current.assertions[freshIndexes[k]], rawBefore: old.raw[index], rawAfter: current.raw[freshIndexes[k]] }))
+        .filter(pair => pair.after !== undefined);
       const weaker = changed.find(pair => isWeaker(pair.rawBefore, pair.rawAfter, language));
       if (weaker) {
         result.immediate.push(finding("assertion-weakened", newPath, current.line,
@@ -623,7 +761,10 @@ export function analyzeGuardFile(file: string, oldText: string | null, newText: 
     const swallowing = (text: string) => text.split(/\r?\n/).map((line, index) => ({ line: line.trim(), index }))
       .filter(item => !item.line.startsWith("#") && CI_RUNNER.test(item.line) && SHELL_SWALLOW.test(item.line));
     const was = swallowing(oldText), now = swallowing(newText);
-    if (now.length > was.length) {
+    // A `continue-on-error: true` that went away in the same change was the same tolerance written another way.
+    const tolerance = (text: string) => text.split(/\r?\n/).filter(line => !line.trim().startsWith("#") && /continue-on-error:\s*true|allow_failure:\s*true/.test(line)).length;
+    const traded = Math.max(0, tolerance(oldText) - tolerance(newText));
+    if (now.length > was.length + traded) {
       const known = new Set(was.map(item => item.line));
       const fresh = now.find(item => !known.has(item.line)) ?? now[0];
       out.push(finding("guard-weakened", file, fresh.index + 1, fresh.line.slice(0, 80), "Test command can no longer fail the CI step", commit));
