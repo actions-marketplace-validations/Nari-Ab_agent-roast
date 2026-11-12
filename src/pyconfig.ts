@@ -4,7 +4,8 @@
 
 export type Report = (line: number, snippet: string, reason: string) => void;
 
-interface Entry { section: string; key: string; value: string; line: number }
+/** `block` is 0 for an ordinary table and n for the nth `[[array of tables]]` element of that name: `[[tool.mypy.overrides]]` is written once per module. */
+interface Entry { section: string; key: string; value: string; line: number; block: number }
 
 /** Brackets and braces still open once strings and comments are blanked: a TOML array or inline table runs until it is zero. */
 function openBrackets(text: string): number {
@@ -22,12 +23,17 @@ function openBrackets(text: string): number {
 export function configEntries(text: string, toml: boolean): Entry[] {
   const lines = text.split(/\r?\n/);
   const entries: Entry[] = [];
-  let section = "";
+  const elements = new Map<string, number>();
+  let section = "", block = 0;
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
     if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
-    const header = /^\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:[#;].*)?$/.exec(trimmed);
-    if (header) { section = header[1].replace(/["']/g, ""); continue; }
+    const header = /^(\[\[?)\s*([^\]]+?)\s*\]\]?\s*(?:[#;].*)?$/.exec(trimmed);
+    if (header) {
+      section = header[2].replace(/["']/g, "");
+      block = header[1] === "[[" ? (elements.set(section, (elements.get(section) ?? 0) + 1), elements.get(section)!) : 0;
+      continue;
+    }
     const pair = /^("[^"]*"|'[^']*'|[\w.-]+)\s*=\s*(.*)$/.exec(trimmed);
     if (!pair) continue;
     const start = i;
@@ -37,16 +43,21 @@ export function configEntries(text: string, toml: boolean): Entry[] {
     } else {
       while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]) && !/^\s*[#;]/.test(lines[i + 1])) value += "\n" + lines[++i].trim();
     }
-    entries.push({ section, key: pair[1].replace(/["']/g, ""), value, line: start + 1 });
+    entries.push({ section, key: pair[1].replace(/["']/g, ""), value, line: start + 1, block });
   }
   return entries;
 }
 
+/** A value without its comments, which may quote words of their own: `"EM",  # allow Exception("text")` keeps the code and drops the rest. Strings are
+ * kept whole, so a `#` inside one does not start a comment. */
+const withoutComments = (value: string) => value.replace(/"(?:\\.|[^"\\\n])*"|'[^'\n]*'|[#;][^\n]*/g, found => (found[0] === "#" || found[0] === ";" ? "" : found));
+
 /** The members of a list value: the quoted strings of a TOML array, or the words and codes of an INI list. */
 function members(value: string): string[] {
-  const quoted = [...value.matchAll(/"((?:\\.|[^"\\\n])*)"|'([^'\n]*)'/g)].map(match => (match[1] ?? match[2]).trim()).filter(Boolean);
+  const code = withoutComments(value);
+  const quoted = [...code.matchAll(/"((?:\\.|[^"\\\n])*)"|'([^'\n]*)'/g)].map(match => (match[1] ?? match[2]).trim()).filter(Boolean);
   if (quoted.length) return quoted;
-  return value.replace(/[#;].*$/gm, "").split(/[\s,]+/).map(word => word.trim()).filter(Boolean);
+  return code.split(/[\s,]+/).map(word => word.trim()).filter(Boolean);
 }
 
 /** Does a rule selector (`ALL`, `E`, `E5`, `E501`) cover a rule code? A selector is a prefix inside one linter: `B` is bugbear and
@@ -115,8 +126,32 @@ export function analyzePythonConfig(file: string, oldText: string, newText: stri
     const base = explicit.length ? explicit : tool === "ruff" ? ["E4", "E7", "E9", "F"] : ["E", "F", "W", "C90"];
     return [...base, ...extra].some(selected => covers(selected, code) || covers(code, selected));
   };
+  // A bump of the Python version or of ruff itself brings rules of its own (`UP006` applies once the project needs Python 3.9, `RUF022` came with ruff 0.8):
+  // ignoring them in the same change keeps the checks that were in force, it does not switch any off.
+  // Raised, not just changed: a setting that is in both versions of the file, with a higher number in the new one (the highest of several, for a pin written twice).
+  // `py38` reads as 3.8 and `py311` as 3.11.
+  const versionParts = (text: string) => /^\d{2,}$/.test(text) ? [Number(text[0]), Number(text.slice(1))] : text.split(".").map(Number);
+  const higher = (was: number[], now: number[]) => {
+    for (let index = 0; index < Math.max(was.length, now.length); index++) if ((now[index] ?? 0) !== (was[index] ?? 0)) return (now[index] ?? 0) > (was[index] ?? 0);
+    return false;
+  };
+  const newest = (text: string, pattern: RegExp): number[] | null => {
+    let best: number[] | null = null;
+    for (const match of text.matchAll(pattern)) {
+      const parts = versionParts(match[1]);
+      if (!best || higher(best, parts)) best = parts;
+    }
+    return best;
+  };
+  const versions = [
+    /^\s*requires-python\s*=\s*["'][<>=!~^\s]*(\d+(?:\.\d+)*)/gm,
+    /^\s*target-version\s*=\s*["']?(?:py)?(\d+(?:\.\d+)*)/gm,
+    /^\s*python_version\s*=\s*["']?(\d+(?:\.\d+)*)/gm,
+    /\bruff\s*(?:(?:===|==|~=|>=|>)\s*["']?|=\s*["'][\^~>=]*)(\d+(?:\.\d+)*)/g,
+  ];
+  const bumped = versions.some(pattern => { const was = newest(oldText, pattern), now = newest(newText, pattern); return !!was && !!now && higher(was, now); });
   for (const [tool, bucket] of ignored(after)) {
-    if (!configured.has(tool as "ruff")) continue;
+    if (!configured.has(tool as "ruff") || (tool === "ruff" && bumped)) continue;
     const old = [...(was.get(tool)?.keys() ?? [])];
     const fresh = [...bucket].filter(([code]) => !old.some(known => covers(known, code)) && enforced(tool, code));
     if (fresh.length) report(Math.min(...fresh.map(([, line]) => line)), `${tool} ignore: ${fresh.slice(0, 4).map(([code]) => "+" + code).join(", ")}${fresh.length > 4 ? ", …" : ""}`, "Lint or type checks switched off in the configuration");
@@ -134,11 +169,18 @@ export function analyzePythonConfig(file: string, oldText: string, newText: stri
     }
   }
 
-  // mypy: a strictness switch turned off, or a module whose errors are now ignored.
-  const switches = new Map(before.filter(entry => toolOf(file, entry.section) === "mypy" && MYPY_SWITCHES.test(entry.key)).map(entry => [`${entry.section}|${entry.key}`, truthy(entry.value)]));
+  // mypy: a strictness switch turned off, or a module whose errors are now ignored. Each `[[tool.mypy.overrides]]` element is a table of its own,
+  // named by its `module`: `check_untyped_defs = false` for `tests.*` next to `true` for `examples.fastapi.*` is not one switch that was turned off.
+  const tableOf = (entries: Entry[]) => {
+    const modules = new Map<string, string>();
+    for (const entry of entries) if (entry.block && entry.key === "module") modules.set(`${entry.section}#${entry.block}`, members(entry.value).join(","));
+    return (entry: Entry) => entry.block ? `${entry.section}#${modules.get(`${entry.section}#${entry.block}`) ?? entry.block}` : entry.section;
+  };
+  const tableBefore = tableOf(before), tableAfter = tableOf(after);
+  const switches = new Map(before.filter(entry => toolOf(file, entry.section) === "mypy" && MYPY_SWITCHES.test(entry.key)).map(entry => [`${tableBefore(entry)}|${entry.key}`, truthy(entry.value)]));
   for (const entry of after) {
     if (toolOf(file, entry.section) !== "mypy" || !MYPY_SWITCHES.test(entry.key)) continue;
-    if (switches.get(`${entry.section}|${entry.key}`) === true && !truthy(entry.value)) report(entry.line, `mypy ${entry.key}: true → false`, "Type checker strictness switched off");
+    if (switches.get(`${tableAfter(entry)}|${entry.key}`) === true && !truthy(entry.value)) report(entry.line, `mypy ${entry.key}: true → false`, "Type checker strictness switched off");
   }
   const ignoring = (entries: Entry[]) => entries.filter(entry => toolOf(file, entry.section) === "mypy" && entry.key === "ignore_errors" && truthy(entry.value));
   const before_ = ignoring(before), after_ = ignoring(after);
