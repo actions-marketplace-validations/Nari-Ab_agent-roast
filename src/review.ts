@@ -1,7 +1,7 @@
 import path from "path";
 import { applyExceptions } from "./exceptions.js";
 import { auditFileDiffs, isCodeFile, isTestFile } from "./metrics.js";
-import { analyzeGuardFile, analyzeTestFile, ciTestSteps, gatingTestCommands, isGuardFile, isTestMarker, newTestMarkers, resolveCiTestSteps, resolveTampering } from "./tampering.js";
+import { analyzeGuardFile, analyzeTestFile, ciTestSteps, enforcedTestCommands, gatingCalls, lostCalls, resolveLostCallers, isGuardFile, isTestMarker, newTestMarkers, resolveCiTestSteps, resolveTampering } from "./tampering.js";
 import type { CiTestCount, FileTampering } from "./tampering.js";
 import { findingFingerprint } from "./baseline.js";
 import { ConfigError, CONFIG_FILENAMES, configFromText } from "./config.js";
@@ -88,6 +88,9 @@ async function compareSnapshot(options: SourceReview, cwd: string, snapshot?: Sn
   const tamperingFiles: FileTampering[] = [];
   const guardFindings: Infraction[] = [];
   const ciCounts: CiTestCount[] = [];
+  const calledInChange = new Set<string>(); // the workflows that a workflow of this change calls
+  const lostCalledWorkflows = new Set<string>(); // workflows that this change stops calling, from a caller that was gating
+  const touchedCiContent = new Map<string, string | null>(); // the new text (null if deleted) of every CI file this change touches, by its new path
   let productionChanged = false;
   const decode = (content: Buffer): string => {
     totalBytes += content.length;
@@ -123,7 +126,12 @@ async function compareSnapshot(options: SourceReview, cwd: string, snapshot?: Sn
         const newText = await readNew(change);
         guardFindings.push(...analyzeGuardFile(change.newPath, oldText, newText, refs.headSha));
         const ci = ciTestSteps(change.newPath, oldText, newText);
-        if (ci) ciCounts.push(ci);
+        if (ci) {
+          ciCounts.push(ci);
+          touchedCiContent.set(change.newPath, newText);
+          for (const workflow of lostCalls(change.newPath, oldText, newText)) lostCalledWorkflows.add(workflow);
+          if (newText !== null) for (const workflow of gatingCalls(change.newPath, newText)) calledInChange.add(workflow);
+        }
         result.filesInspected++;
       } catch (error) {
         assertNotAborted(options.signal);
@@ -181,21 +189,39 @@ async function compareSnapshot(options: SourceReview, cwd: string, snapshot?: Sn
   await snapshot?.verify();
   result.complete = result.skippedFiles.length === 0;
   const rules = policy.config.rules ?? {};
-  // A workflow that lost its test steps may only have been a duplicate: the test commands that the workflows this change did not touch still run are read only then.
-  const elsewhere = new Set<string>();
-  if (ciCounts.some(item => item.before > 0 && item.after === 0 && item.reusableAfter === 0)) {
+  // A workflow that lost its test steps may only have been a duplicate, or one that another workflow calls: the test commands that the workflows this change did not touch still run,
+  // and the workflows that they call (next to the ones that the workflows of this change call), are read only then; so is the content of a reusable workflow
+  // this change stops calling, when that workflow is itself untouched.
+  const elsewhere = new Set<string>(), called = new Set<string>(calledInChange);
+  const untouchedLostCallerContent = new Map<string, string>();
+  if (ciCounts.some(item => item.before > 0 && item.after === 0 && item.reusableAfter === 0) || lostCalledWorkflows.size > 0) {
     const touched = new Set(changes.flatMap(change => [change.oldPath, change.newPath]));
     // The tree to read them from: the head commit, or HEAD for a review of the index or the working tree (whose head is a digest, not a commit);
     // a file that this change did not touch is the same there.
     const tree = /^[a-f0-9]{40,64}$/.test(refs.headSha) ? refs.headSha : refs.baseSha;
     try {
       for (const file of (await ciFilesAt(cwd, tree, options.signal)).filter(candidate => !touched.has(candidate.path)).slice(0, 100)) {
-        try { for (const command of gatingTestCommands(file.path, new TextDecoder().decode(await readBlob(cwd, file.oid, options.signal, 512 * 1024)))) elsewhere.add(command); }
+        try {
+          const text = new TextDecoder().decode(await readBlob(cwd, file.oid, options.signal, 512 * 1024));
+          for (const command of enforcedTestCommands(file.path, text)) elsewhere.add(command);
+          for (const workflow of gatingCalls(file.path, text)) called.add(workflow);
+          if (lostCalledWorkflows.has(file.path)) untouchedLostCallerContent.set(file.path, text);
+        }
         catch (error) { assertNotAborted(options.signal); }
       }
     } catch (error) { assertNotAborted(options.signal); }
   }
-  result.infractions.push(...[...resolveTampering(tamperingFiles, productionChanged), ...guardFindings, ...resolveCiTestSteps(ciCounts, refs.headSha, elsewhere)].filter(finding => rules[finding.type] !== "off"));
+  const ciFindings = resolveCiTestSteps(ciCounts, refs.headSha, elsewhere, called);
+  // A reusable workflow already flagged above (its own trigger changed in this diff) is not flagged again here for the same loss.
+  const alreadyFlagged = new Set(ciFindings.map(found => found.file));
+  const lostCallers = new Map<string, { content: string; stillCalled: boolean }>();
+  for (const workflow of lostCalledWorkflows) {
+    if (alreadyFlagged.has(workflow)) continue;
+    const content = touchedCiContent.has(workflow) ? touchedCiContent.get(workflow) ?? null : untouchedLostCallerContent.get(workflow) ?? null;
+    if (content === null) continue; // deleted together with its only caller, or unreadable: nothing to report
+    lostCallers.set(workflow, { content, stillCalled: called.has(workflow) });
+  }
+  result.infractions.push(...[...resolveTampering(tamperingFiles, productionChanged), ...guardFindings, ...ciFindings, ...resolveLostCallers(lostCallers, refs.headSha)].filter(finding => rules[finding.type] !== "off"));
   const exceptions = applyExceptions(result.infractions, options.ignoreExceptions ? [] : policy.config.exceptions, new Date(), existingCounts);
   result.infractions = exceptions.findings;
   result.suppressedFindings = exceptions.suppressedFindings;
